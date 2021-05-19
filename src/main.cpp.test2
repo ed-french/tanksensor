@@ -1,0 +1,696 @@
+#include <Arduino.h>
+
+#include <Wire.h>
+
+#include "hmc5883l.h"
+
+
+//!!#include <Adafruit_Sensor.h>
+//!!#include <Adafruit_HMC5883_U.h>
+
+#ifdef ESP32
+  #include <WiFi.h>
+#endif
+
+#include <SPI.h>             
+#include <LoRa.h>
+#include <crc16.h> // For CRC checking messages
+
+
+#define LORA_RESENDS 2 // Number of times each message is sent
+
+#define NODE_ID 0x08    // Address of this node
+
+#define LORA_SS_PIN 5
+#define LORA_RESET_PIN 14
+#define LORA_DIO0_PIN 2
+
+#define STEP_CHANGE_THRESHOLD 1.1// 1.5 is approximately 4.5 standard deviations, should be 1 false alarm every 3 days
+#define CALIBRATION_READINGS 10
+
+#define NORMAL_SLEEP_MICROS 1000000
+
+#define MESSAGE_DESTINATION_NODE 0x01 // Broadcast only to master node, all others will ignore
+
+#ifdef ESP32
+  #define LED_PIN 22
+#else
+  #define LED_PIN LED_BUILTIN
+#endif
+
+#define LED_OFF HIGH
+#define LED_ON LOW
+
+
+
+
+/* message format is:
+
+Offset range        Content
+============        ==============================
+0                   Destination (0xFF=BROADCAST, 0x01=MASTER,0x02=ERROR REPORTING)
+1-4                 Message ID (32 bit random no.)
+5                   Sender (0x01 MASTER, 0xFF is illegal)
+6                   Type - see enum below
+7-51                45 bytes of message content
+52-53               16 bit CRC of message              
+
+
+
+
+*/
+#define CORE_MESSAGE_LENGTH 52
+#define BROADCAST_ADDRESS 0xFF
+#define MASTER_ADDRESS 0x01
+#define ERROR_REPORTING_ADDRESS 0x02
+#define STILL_ALIVE_MASK 0x01FF// For frequent set to 0x007F
+
+#define ARM_DELAY 300 // Seconds - 5 mins
+
+enum  MessageType : uint8_t
+{
+  LOWER_ENUM_BOUND=1,
+  NORMAL=2,
+  BROADCAST=3,
+  ACKNOWLEDGEMENT=4,
+  ERROR=6,
+  RESERVED=7,
+  RESERVED2=8,
+  RESERVED3=9,
+  UPPER_ENUM_BOUND=10
+};
+
+enum MessageState
+{
+  READY_TO_SEND,
+  SENT_NOT_ACKNOWLEDGED,
+  ACKNOWLEDGED_NOT_DELETED
+};
+
+
+
+class  LoraMessage
+{
+  public:
+    uint8_t destination;
+    uint8_t sender;
+    MessageType type;
+    uint32_t message_id;
+    uint16_t checksum;
+    char content[45];
+
+    LoraMessage()
+    {//Declare an empty message, normal for sending
+        // Generate an ID
+        //for (int i=0;i<20;i++)
+        //{
+            message_id=random(2147483647);
+            //Serial.print("Message id set to : ");
+            //Serial.println(message_id);
+        //}
+    }
+
+    LoraMessage(char * received, uint8_t messagelength)
+    {// Constructor used with a received message
+    // tries to parse it into a valid object
+    // If it fails it sets the MessageType to error
+
+      // Reset the message to error
+      memset(content,0,sizeof content);
+      char * defaultcontent="Error parsing message";
+      strcpy(content,defaultcontent);
+      type=(MessageType)255;
+      destination=2;
+      sender=2;
+      message_id=999;
+
+    // Deserialization here with lots of error checks!
+    
+      // Do we have the right number of bytes
+      if (messagelength!=CORE_MESSAGE_LENGTH+2)
+      {
+        type=ERROR;
+        Serial.print("Wrong message length : ");
+        Serial.println(strlen(received));
+        return;
+      }
+
+
+      // does the CRC match
+      uint16_t calcedcrc=calcCRC(received,messagelength-2);
+      //Serial.print("Calculated CRC should be : "); //Correct
+      //Serial.println(calcedcrc);
+
+      uint16_t rxedcrc=(uint16_t)(uint8_t)received[CORE_MESSAGE_LENGTH]+256*(uint16_t)(uint8_t)received[CORE_MESSAGE_LENGTH+1];
+      //Serial.print("Received CRC was : ");
+      //Serial.println(rxedcrc);
+      //Serial.println((uint16_t)(uint8_t)received[CORE_MESSAGE_LENGTH]);
+      //Serial.println((uint16_t)(uint8_t)received[CORE_MESSAGE_LENGTH+1]);
+
+      if (calcedcrc!=rxedcrc)
+      {
+        type=ERROR;
+        Serial.println("CRC does not match.");
+        return;
+      }
+      // Enough with the checks, now just deserialize the bits
+      uint8_t * p=(uint8_t *)received; // Pointer to traverse the rx'ed data
+      memcpy(&destination,p,1);
+      //Serial.print("Destination : ");
+      //Serial.println(destination);
+      p++;
+      memcpy(&message_id,p,4);
+      //Serial.print("ID : ");
+      //Serial.println(message_id);
+      p=p+4;
+      memcpy(&sender,p,1);
+      //Serial.print("Sender : ");
+      //Serial.println(sender);
+      p++;
+      memcpy(&type,p,1);
+      //Serial.print("Type : ");
+      //Serial.println(type);
+      p++;
+      memcpy(&content,p,45);
+      // is type a valid enum type
+      if ((type<=LOWER_ENUM_BOUND) | (type>=UPPER_ENUM_BOUND))
+      {
+        type=ERROR;
+        Serial.print("Out of bounds for message type : ");
+        Serial.println(type);
+        return;
+      }
+
+
+
+
+    
+
+    } // End of constructor using rx'ed string
+
+    void setDestination(uint8_t dest)
+    {
+        destination=dest;
+    }  
+    void setSender(uint8_t send_to)
+    {
+        sender=send_to;
+    }
+    void setType(MessageType typ)
+    {
+        type=typ;
+    }
+    void setContent(char * cont)
+    {
+        strncpy(content,cont,45);
+    }
+
+    uint16_t calcCRC(char* str,uint8_t length)
+      {
+        uint16_t crc=0; // starting value as you like, must be the same before each calculation
+        for (int i=0;i<length;i++) // for each character in the string
+        {
+          crc= _crc16_update (crc, str[i]); // update the crc value
+        }
+        return crc;
+      }
+
+    char * serialize()
+    {// Returns a complete string for the message including checksum
+        char *result=(char *)malloc(CORE_MESSAGE_LENGTH+2);
+        char * p=result; // move this pointer along as we go
+        *p=destination;
+        p++;
+        memcpy(p,&message_id,4);
+        p=p+4;
+        *p=sender;
+        p++;
+        *p=type;
+        p++;
+        memcpy(p,&content,45);
+        p=p+45;
+        uint16_t crc=calcCRC(result,CORE_MESSAGE_LENGTH);
+        memcpy(p,&crc,2);
+        return result;
+    }
+
+    void print()
+    {// Returns a printable version of the message
+        Serial.print("Message ID : ");
+        Serial.println(message_id);
+        Serial.print("Type : ");
+        Serial.println(type);
+        Serial.print("Sender : ");
+        Serial.println(sender);
+        Serial.print("Destination :");
+        Serial.println(destination);
+        Serial.println("Content :");
+        Serial.println(content);
+
+    }
+
+    
+};
+
+
+void sendMessage(LoraMessage mess) {
+  Serial.println("About to send ...");
+  mess.print();
+  LoRa.beginPacket();                   // start packet
+  //char * rawbytes=testmsg.serialize();
+  char * serialized=mess.serialize();
+  LoRa.write((uint8_t*)serialized,CORE_MESSAGE_LENGTH+2);              // add destination address
+  free(serialized);
+  LoRa.endPacket();                     // finish packet and send it
+                   // increment message ID
+}
+
+
+void onReceive(int packetSize) 
+{// Handles incoming packets and parses out a message from the packet
+  if (packetSize == 0) return;          // if there's no packet, return
+  Serial.println("Found something....");
+  static char buffer[CORE_MESSAGE_LENGTH+2];// Somewhere to put the answer for a bit
+
+  for (int i=0;(i<CORE_MESSAGE_LENGTH+2 && LoRa.available());i++)
+  {
+    buffer[i]=LoRa.read();
+  }
+  if (LoRa.available())
+  {
+    // Dump extra bytes
+    while(LoRa.available())
+    {
+      Serial.print("xx"+LoRa.read());
+    }
+  }
+Serial.println(buffer);
+
+  LoraMessage mess=LoraMessage((char *)buffer,CORE_MESSAGE_LENGTH+2);
+  
+  // For now just print it out
+
+  Serial.println("Received new message....");
+
+  // Note could still be an error!
+
+  mess.print();
+
+  if (mess.type!=NORMAL)
+  {
+    Serial.println("Not a normal message, could be an error");
+  }
+
+  // Check message is intended for the gate
+  if (mess.destination!=NODE_ID) 
+  {
+    Serial.println("Not for this node");
+    return; // We can ignore other packets, we are a gate!
+  }
+  // Process the received message, if any
+
+
+
+}
+
+
+
+
+
+
+/* Assign a unique ID to this sensor at the same time */
+//!!Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(12345);
+
+hmc5883l mag;
+
+// void displaySensorDetails(void)
+// {
+//   sensor_t sensor;
+//   mag.getSensor(&sensor);
+//   Serial.println("------------------------------------");
+//   Serial.print  ("Sensor:       "); Serial.println(sensor.name);
+//   Serial.print  ("Driver Ver:   "); Serial.println(sensor.version);
+//   Serial.print  ("Unique ID:    "); Serial.println(sensor.sensor_id);
+//   Serial.print  ("Max Value:    "); Serial.print(sensor.max_value); Serial.println(" uT");
+//   Serial.print  ("Min Value:    "); Serial.print(sensor.min_value); Serial.println(" uT");
+//   Serial.print  ("Resolution:   "); Serial.print(sensor.resolution); Serial.println(" uT");  
+//   Serial.println("------------------------------------");
+//   Serial.println("");
+//   delay(500);
+// }
+
+
+
+char message_content_buffer[150];
+//sensors_event_t event; 
+
+
+RTC_DATA_ATTR float last_x;
+RTC_DATA_ATTR float last_y;
+RTC_DATA_ATTR float last_z;
+
+void sendLora(char * message)
+{
+  
+  Serial.println("Starting up lora");
+  delay(20);
+  LoRa.setPins(LORA_SS_PIN,LORA_RESET_PIN, LORA_DIO0_PIN);// should be 8
+  LoRa.setCodingRate4(8);// Default is 5, should improve link budget at cost of b/w
+  LoRa.setSpreadingFactor(10);// Default is 7 so link budget should be improved
+  LoRa.setSignalBandwidth(20.8E3);// defaults to 125kHz 125E3
+  LoRa.setTxPower(20);// default is 17
+ 
+  Serial.println("Set pins");
+  delay(20);
+  if (!LoRa.begin(433E6)) 
+  {             // initialize ratio at 433 MHz
+    Serial.println("LoRa init failed. Check your connections.");
+    while (true);                       // if failed, do nothing
+  }
+
+  Serial.println("LoRa established");
+  delay(20);
+
+
+  
+  Serial.printf("Sending %s\n",message);
+
+  // Typical message: DRIVE:x:120.3,y:-43.2,z:0.02,battery:3.432
+
+  
+  LoraMessage mess=LoraMessage();
+  mess.setType(NORMAL);
+  mess.setDestination(MASTER_ADDRESS);
+  mess.setSender(NODE_ID);
+  mess.setContent(message);
+  sendMessage(mess);
+}
+
+#ifdef ESP32
+bool woken_from_timed_sleep(){
+  esp_sleep_wakeup_cause_t wakeup_reason;
+
+  wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  switch(wakeup_reason)
+  {
+    case ESP_SLEEP_WAKEUP_EXT0 : Serial.println("Wakeup caused by external signal using RTC_IO"); break;
+    case ESP_SLEEP_WAKEUP_EXT1 : Serial.println("Wakeup caused by external signal using RTC_CNTL"); break;
+    case ESP_SLEEP_WAKEUP_TIMER : Serial.println("Wakeup caused by timer"); return true;
+    case ESP_SLEEP_WAKEUP_TOUCHPAD : Serial.println("Wakeup caused by touchpad"); break;
+    case ESP_SLEEP_WAKEUP_ULP : Serial.println("Wakeup caused by ULP program"); break;
+    default : Serial.printf("Wakeup was not caused by deep sleep: %d\n",wakeup_reason); break;
+  }
+  return false;
+}
+#endif
+
+#ifdef ESP32
+float getBatVolts()
+{
+  return analogRead(34)*0.001856;
+}
+#else
+float getBatVolts()
+{
+  return -1.0;// analogRead(34)*0.001856;
+}
+#endif
+
+
+
+// void recalibrate()
+// {
+//   // Calibrates/zeros the compass
+
+//     // Now establish some starting values for the compass
+//     float x_accum=0;
+//     float y_accum=0;
+//     float z_accum=0;
+//     Serial.println("Starting calibration");
+//     for (uint16_t i=0;i<5;i++)
+//     {
+//       printf("Calibration reading no: %d",i);
+//       //!!mag.getEvent(&event);// Get a new reading
+//       Serial.printf("Found reading of: %f,%f,%f\n",event.magnetic.x,event.magnetic.y,event.magnetic.z);
+//       x_accum+=event.magnetic.x;
+//       y_accum+=event.magnetic.y;
+//       z_accum+=event.magnetic.z;
+//       delay(1000);
+//     }
+//     last_x=x_accum/5.0;
+//     last_y=y_accum/5.0;
+//     last_z=z_accum/5.0;
+//     Serial.printf("Determined initial mean as : %f,%f,%f\n",last_x,last_y,last_z);
+
+// }
+
+
+class Trigger
+{
+  public:
+    hmc5883l sensor;
+    magnetic_t baseline;
+    bool calibrated=false;
+    magnetic_t latest;
+    uint16_t threshold=10;
+    uint16_t last_jump=0;
+    bool moved=false;
+
+
+    bool begin()
+    {
+      // Initialise the sensor, return false if it fails
+      if (!sensor.begin()) return false;
+      calibrate();// calibrate/zero the sensor
+
+    }
+
+    void setThreshold(uint16_t thresh)
+    {
+      threshold=thresh;
+    }
+
+    bool sense()
+    {
+      // Returns true if it's triggered
+      latest=mag.getReading();
+      last_jump=0;
+      last_jump+=abs(baseline.x-latest.x);
+      last_jump+=abs(baseline.y-latest.y);
+      last_jump+=abs(baseline.z-latest.z);
+      
+      moved= (last_jump>threshold);
+      return moved;
+
+    }
+
+    void calibrate()
+    {
+      // Takes 5 readings and averages them
+      float zzz;
+
+      int16_t x_accum=0;
+      
+      int16_t y_accum=0;
+      int16_t z_accum=0;
+      for (uint8_t i=0;i<CALIBRATION_READINGS;i++)
+      {
+        delay(200);
+        magnetic_t reading=sensor.getReading();
+        x_accum+=reading.x;
+        y_accum+=reading.y;
+        z_accum+=reading.z;
+
+
+      }
+      baseline.x=(int16_t)(((float)x_accum/(float)CALIBRATION_READINGS)+0.5);
+      baseline.y=(int16_t)(((float)y_accum/(float)CALIBRATION_READINGS)+0.5);
+      baseline.z=(int16_t)(((float)z_accum/(float)CALIBRATION_READINGS)+0.5);
+
+
+
+    }
+}
+
+
+
+
+void setup(void) 
+{
+  #ifdef ESP32
+  WiFi.mode(WIFI_OFF);
+  #endif
+  // pinMode(LED_PIN,OUTPUT);
+  // digitalWrite(LED_PIN,LED_ON);
+  #ifdef ESP32
+  setCpuFrequencyMhz(80);
+  Serial.begin(115200);
+  #endif
+
+
+
+
+  
+
+  //Serial.println("HMC5883 Magnetometer Test"); Serial.println("");
+  
+  /* Initialise the sensor */
+  if(!mag.begin())
+  {
+    /* There was a problem detecting the HMC5883 ... check your connections */
+    Serial.println("Ooops, no HMC5883 detected ... Check your wiring!");
+    while(1);
+  }
+  
+  /* Display some basic information on this sensor */
+  //displaySensorDetails();
+
+  magnetic_t baseline=mag.getReading();
+  uint16_t change=0;
+  bool changed;
+
+  while(false)
+  {
+    uint32_t start=micros();
+    magnetic_t field=mag.getReading();
+    change=jump(baseline,field);
+    changed=(change>10);
+    uint32_t end=micros();
+  
+
+    if (changed)
+    {
+      Serial.printf("x:%d,y:%d,z:%d,change:%d,changed:%s,elapsed:%d\n",field.x,field.y,field.z, change, (changed ? "true" : "false"),(end-start));
+    } 
+    delay(5000);
+    sprintf(message_content_buffer,"Hello-world : %d",change);
+    sendLora(message_content_buffer);
+  }
+
+
+  
+
+  // if (!woken_from_timed_sleep())
+  // {
+  //   pinMode(LED_PIN,OUTPUT);
+  //   bool led_state=LED_OFF;
+  //   digitalWrite(LED_PIN,led_state);
+  //   // Board has been reset, so we spend (5 minutes) just waiting for the machine to be installed
+  //   for (uint32_t i=ARM_DELAY;i>0;i--)
+  //   {
+  //     Serial.println(i);
+  //     delay(1000);
+  //     led_state=!led_state;
+  //     digitalWrite(22,led_state);
+  //   }
+  //   digitalWrite(LED_PIN,LED_OFF);
+  //   Serial.println("armed");
+  //   recalibrate();
+
+
+
+  // }
+  
+  /* Get a new sensor event */ 
+  
+  //!!mag.getEvent(&event);
+ 
+  // /* Display the results (magnetic vector values are in micro-Tesla (uT)) */
+  // Serial.print("X: "); Serial.print(event.magnetic.x); Serial.print("  ");
+  // Serial.print("Y: "); Serial.print(event.magnetic.y); Serial.print("  ");
+  // Serial.print("Z: "); Serial.print(event.magnetic.z); Serial.print("  ");Serial.println("uT");
+
+  // // Compare to previous...
+
+  // float abs_step=abs(event.magnetic.x-last_x)+abs(event.magnetic.y-last_y)+abs(event.magnetic.z-last_z);
+
+
+
+  // Serial.printf("Abs total change: %f/n",abs_step);
+
+  // bool found_change=(abs_step>STEP_CHANGE_THRESHOLD);
+
+  // if (!found_change)
+  // { 
+  //   // Adjust the saved default values
+  //   last_x=((3.0*event.magnetic.x)+last_x)/4.0;
+  //   last_y=((3.0*event.magnetic.y)+last_y)/4.0;
+  //   last_z=((3.0*event.magnetic.z)+last_z)/4.0;
+  //   Serial.printf("New last no-s: %f,%f,%f\n",last_x,last_y,last_z);
+  //   // Small change so we mainly just go back to sleep!
+  //   int32_t rand=random(1000);
+  //   Serial.printf("Random: %d\n",rand);
+  //   if (rand>4) // Basically 995 in 1000 or 199 in 200 or approx all but 1 in 5 minutes
+  //   {
+  //     Serial.print("Straight back to sleep");
+  //     #ifdef ESP32
+  //       esp_sleep_enable_timer_wakeup(2000000); // 1 second
+  //       esp_deep_sleep_start();
+  //     #endif
+  //   }
+  // }
+
+  // // Hold the module so that Z is pointing 'up' and you can measure the heading with x&y
+  // // Calculate heading when the magnetometer is level, then correct for signs of axis.
+  // float heading = atan2(event.magnetic.y, event.magnetic.x);
+  
+  // // Once you have your heading, you must then add your 'Declination Angle', which is the 'Error' of the magnetic field in your location.
+  // // Find yours here: http://www.magnetic-declination.com/
+  // // Mine is: -13* 2' W, which is ~13 Degrees, or (which we need) 0.22 radians
+  // // If you cannot find your Declination, comment out these two lines, your compass will be slightly off.
+  // float declinationAngle = 0.22;
+  // heading += declinationAngle;
+  
+  // // Correct for when signs are reversed.
+  // if(heading < 0)
+  //   heading += 2*PI;
+    
+  // // Check for wrap due to addition of declination.
+  // if(heading > 2*PI)
+  //   heading -= 2*PI;
+   
+  // // Convert radians to degrees for readability.
+  // float headingDegrees = heading * 180/M_PI; 
+  
+  // Serial.print("Heading (degrees): "); Serial.println(headingDegrees);
+
+
+
+
+
+
+
+
+
+
+
+
+
+  // Typical message: DRIVE:x:120.3,y:-43.2,z:0.02,battery:3.432
+
+  // sprintf(message_content_buffer,"DRV_%s:x:%.2f,y:%.2f,z:%.2f,bat:%.2f",found_change ? "CHANGE":"NOCHANGE",event.magnetic.x,event.magnetic.y,event.magnetic.z,getBatVolts());
+  // sendLora(message_content_buffer);
+  // Serial.print("Wating 5 seconds before recalibrating to allow car to pass");
+  // delay(5000);
+  // recalibrate();
+  // #ifdef ESP32
+  // esp_sleep_enable_timer_wakeup(5000000); // 5 seconds lock out to prevent double messages...
+  // esp_deep_sleep_start();
+  // #endif
+
+
+
+
+
+}
+
+
+
+
+void loop(void) 
+{
+  onReceive(LoRa.parseFloat());
+  Serial.println("tick");
+  delay(100);
+}
