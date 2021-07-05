@@ -72,11 +72,25 @@
 #define AVE_OVER_READINGS 10
 #define NODE_ID 9
 #define LORA_RESENDS 2 // Number of times each message is sent
-#define SLEEPTIME_SECS 10 //3*60 // Send every three mins
+#define SLEEPTIME_SECS 3*60 // Send every three mins
 
 
 
 #define ARM_DELAY 10 // Seconds 
+
+
+#ifdef BLACKPILL
+
+#define BATTERY_LEVEL_PIN PA2
+#define LORA_SS_PIN PA4
+#define LORA_RESET_PIN PB_11
+#define LORA_DIO0_PIN PB10
+#define PIN_MEASURE PB4 // Noise used for RNG seed
+
+#define PIN_SENSOR_SDA PB7
+#define PIN_SENSOR_SCL PB6
+
+#else
 
 #define BATTERY_LEVEL_PIN PA2
 #define LORA_SS_PIN PA4
@@ -84,8 +98,12 @@
 #define LORA_DIO0_PIN PB10
 #define PIN_MEASURE PB4 // Noise used for RNG seed
 
+#define PIN_SENSOR_SDA PB7
+#define PIN_SENSOR_SCL PB6
 
+#endif
 
+#define SENSOR_I2C_ADDRESS 0x29 //VL53X0 sensor
 
 #define MESSAGE_DESTINATION_NODE 0x01 // Broadcast only to master node, all others will ignore
 
@@ -460,25 +478,40 @@ void sendLora(char * message)
 }
 
 
-void initialize_sensor(bool closefirst=false)
+bool initialize_sensor(bool closefirst=false)
 {
+  /*
+      Tries to initialise the distance sensor, returning true if it suceeded
+      or false otherwise
+  */
       // Initialise the distance sensor
     if (closefirst) Wire.end();
+
+    int retries=10;
     
 
-    Wire.begin((uint8_t)PB7,(uint8_t)PB6);
-    Wire.setClock(10000);// Set slow mode to cope with long cables
+    Wire.begin((uint8_t)PIN_SENSOR_SDA,(uint8_t)PIN_SENSOR_SCL); // SDA, SCL
+    //Wire.setClock(10000);// Set slow mode to cope with long cables
 
-    sensor.setAddress(0x29);
+    //sensor.setAddress(SENSOR_I2C_ADDRESS);
 
     sensor.setTimeout(500);
     
-
+    Serial.println("Sensor I2C set, up");
     while (!sensor.init())
     {
+
         Serial.println("Failed to detect and initialize sensor!");
+        retries--;
+        if (retries<=0)
+        {
+          return false;
+        }
+
+        
         delay(400);
     }
+    Serial.println("Sensor initialised OK");
 
     
 // // lower the return signal rate limit (default is 0.25 MCPS)
@@ -497,6 +530,7 @@ void initialize_sensor(bool closefirst=false)
   // ms (e.g. sensor.startContinuous(100)).
     //sensor.startContinuous();
   
+  return true;
 }
 
 
@@ -584,15 +618,22 @@ void setup()
         delay(1000);
     }
     seedRNG();
-
-    initialize_sensor(false);
+    Serial.println("Starting to try and initialise the sensor...");
+    while (!initialize_sensor(false))
+    {
+      Serial.println("Failed to initialise the tank depth sensor");
+      sendLora("TANK: SENSOR INIT FAILED");
+      delay(5*60*1000);// Wait 5 mins
+    }
 
     sendLora("TANK: BOOTED");
     
 }
 
-void testloop()
+void i2ctestloop()
 {
+  Wire.begin((uint8_t)PIN_SENSOR_SDA,(uint8_t)PIN_SENSOR_SCL); // SDA, SCL
+  Wire.setClock(10000);// Set slow mode to cope with long cables
   byte error, address;
   int nDevices;
  
@@ -607,6 +648,8 @@ void testloop()
     Wire.beginTransmission(address);
     error = Wire.endTransmission();
  
+
+ 
     if (error == 0)
     {
       Serial.print("I2C device found at address 0x");
@@ -619,7 +662,7 @@ void testloop()
     }
     else if (error==4)
     {
-      Serial.print("Unknown error at address 0x");
+      Serial.printf("Error: %d at address 0x",error);
       if (address<16)
         Serial.print("0");
       Serial.println(address,HEX);
@@ -667,8 +710,9 @@ void loop()
 
 
 
-        LowPower.deepSleep(SLEEPTIME_SECS*1000);
-        //delay(SLEEPTIME_SECS*1000);
+        //LowPower.deepSleep(SLEEPTIME_SECS*1000);
+        //
+        delay(4000);
 
 
         digitalWrite(LED_BUILTIN,LOW);
