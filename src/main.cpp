@@ -53,18 +53,26 @@
 
 
 
+        3.2V = 347
+        3.33V = 631
+        
+
+
+
+
 
 
 
 */
 
 #include <Arduino.h>
-#include "STM32LowPower.h"
+
 #include <Wire.h>
-#include <VL53L0X.h>
+#include "Adafruit_VL53L0X.h"
 #include <SPI.h>
 #include <LoRa.h>
 #include <crc16.h>
+#include "STM32LowPower.h"
 
 
 #define LED_BUILTIN PC13
@@ -83,7 +91,7 @@
 
 #define BATTERY_LEVEL_PIN PA2
 #define LORA_SS_PIN PA4
-#define LORA_RESET_PIN PB_11
+#define LORA_RESET_PIN PC14
 #define LORA_DIO0_PIN PB10
 #define PIN_MEASURE PB4 // Noise used for RNG seed
 
@@ -91,10 +99,10 @@
 #define PIN_SENSOR_SCL PB6
 
 #else
-
+#define HARDWARE_SLEEP
 #define BATTERY_LEVEL_PIN PA2
 #define LORA_SS_PIN PA4
-#define LORA_RESET_PIN PB11
+#define LORA_RESET_PIN PC14
 #define LORA_DIO0_PIN PB10
 #define PIN_MEASURE PB4 // Noise used for RNG seed
 
@@ -153,7 +161,7 @@ enum MessageState
   ACKNOWLEDGED_NOT_DELETED
 };
 
-VL53L0X sensor;
+Adafruit_VL53L0X lox = Adafruit_VL53L0X();
 
 void(* resetFunc) (void) = 0; //declare reset function @ address 0
 
@@ -490,23 +498,24 @@ bool initialize_sensor(bool closefirst=false)
     int retries=10;
     
 
-    Wire.begin((uint8_t)PIN_SENSOR_SDA,(uint8_t)PIN_SENSOR_SCL); // SDA, SCL
+    //Wire.begin((uint8_t)PIN_SENSOR_SDA,(uint8_t)PIN_SENSOR_SCL); // SDA, SCL
     //Wire.setClock(10000);// Set slow mode to cope with long cables
 
     //sensor.setAddress(SENSOR_I2C_ADDRESS);
 
-    sensor.setTimeout(500);
+    //sensor.setTimeout(500);
     
     Serial.println("Sensor I2C set, up");
-    while (!sensor.init())
+    while (true)
     {
-
-        Serial.println("Failed to detect and initialize sensor!");
-        retries--;
-        if (retries<=0)
-        {
-          return false;
-        }
+      //TwoWire tw=TwoWire((uint8_t)PIN_SENSOR_SDA,(uint8_t)PIN_SENSOR_SCL);
+      if (lox.begin())//lox.begin(0x29,true,&tw))
+      {
+        Serial.println("sensor OK");
+        break;
+      }
+      //tw.end();
+      Serial.println(F("Failed to boot VL53L0X"));
 
         
         delay(400);
@@ -522,7 +531,7 @@ bool initialize_sensor(bool closefirst=false)
 
 
 // increase timing budget to 200 ms to inc accuracy
-  sensor.setMeasurementTimingBudget(SENSOR_TIMING_BUDGET);
+  //sensor.setMeasurementTimingBudget(SENSOR_TIMING_BUDGET);
 
   // Start continuous back-to-back mode (take readings as
   // fast as possible).  To use continuous timed mode
@@ -542,11 +551,19 @@ float getReading()
   //sensor.startContinuous();
   Serial.print("(");
   uint16_t bad_count=0;
+  VL53L0X_RangingMeasurementData_t measure;
+  uint16_t reading;
   while (count<AVE_OVER_READINGS)
   {
     
-
-    uint16_t reading=sensor.readRangeSingleMillimeters();//readRangeContinuousMillimeters();
+    lox.rangingTest(&measure, false); // pass in 'true' to get debug data printout!
+    //uint16_t reading=sensor.readRangeSingleMillimeters();//readRangeContinuousMillimeters();
+    if (measure.RangeStatus != 4) {  // phase failures have incorrect data
+      reading=measure.RangeMilliMeter;
+    } else {
+      Serial.println(" out of range ");
+      reading=65535;
+    }
     if (reading==65535) 
     {
       Serial.print("!");
@@ -554,7 +571,7 @@ float getReading()
     Serial.print(reading);
     Serial.print(",");
 
-    if (!sensor.timeoutOccurred() && reading<8000)
+    if (reading<8000)
     {
       // Valid reading
       
@@ -625,9 +642,11 @@ void setup()
       sendLora("TANK: SENSOR INIT FAILED");
       delay(5*60*1000);// Wait 5 mins
     }
-
-    sendLora("TANK: BOOTED");
     
+    sendLora("TANK: BOOTED");
+    #ifdef HARDWARE_SLEEP
+      LowPower.begin();
+    #endif
 }
 
 void i2ctestloop()
@@ -699,6 +718,7 @@ void loop()
 
         sprintf(buf,"TANK:LEVEL:%s,BATTERY:%d",reading_str,bat);
         Serial.println(buf);
+        
         sendLora(buf);
         
         Serial.printf("Free memory : %d\n",freeMemory());
@@ -709,10 +729,11 @@ void loop()
 
 
 
-
-        //LowPower.deepSleep(SLEEPTIME_SECS*1000);
-        //
-        delay(4000);
+        #ifdef HARDWARE_SLEEP
+          LowPower.deepSleep((uint32_t)SLEEPTIME_SECS*1000);
+        #else
+          delay(4000);
+        #endif
 
 
         digitalWrite(LED_BUILTIN,LOW);
